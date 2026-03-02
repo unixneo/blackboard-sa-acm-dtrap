@@ -1,0 +1,644 @@
+#!/bin/bash
+#
+# blackboard - Start/stop script for Blackboard application
+# 
+# Manages: Redis, Rails server, and Sidekiq workers
+# Usage: blackboard start | stop | status | restart
+#
+
+set -e
+
+# Configuration
+APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PID_DIR="$APP_DIR/tmp/pids"
+LOG_DIR="$APP_DIR/log"
+
+RAILS_PORT="${PORT:-3005}"
+REDIS_URL="${REDIS_URL:-redis://localhost:6379/1}"
+SIDEKIQ_QUEUES="-q default -q sensors -q supervisor -q control_shell -q mailers"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Ensure directories exist
+mkdir -p "$PID_DIR" "$LOG_DIR"
+
+#------------------------------------------------------------------------------
+# Helper functions
+#------------------------------------------------------------------------------
+
+log_ok() {
+  echo -e "${GREEN}✓ $1${NC}"
+}
+
+log_fail() {
+  echo -e "${RED}✗ $1${NC}"
+}
+
+log_warn() {
+  echo -e "${YELLOW}⚠ $1${NC}"
+}
+
+log_info() {
+  echo -e "  $1"
+}
+
+find_psql() {
+  command -v psql 2>/dev/null && return 0
+  for p in \
+    /opt/homebrew/bin/psql \
+    /usr/local/bin/psql \
+    /opt/homebrew/opt/postgresql@17/bin/psql \
+    /opt/homebrew/opt/postgresql@16/bin/psql \
+    /opt/homebrew/opt/postgresql@15/bin/psql \
+    /opt/homebrew/opt/postgresql@14/bin/psql \
+    /usr/bin/psql; do
+    [ -x "$p" ] && echo "$p" && return 0
+  done
+  return 1
+}
+
+is_running() {
+  local pidfile="$1"
+  local expected_cmd_regex="${2:-}"
+  local pid
+  pid=$(read_pid "$pidfile") || return 1
+  ps -p "$pid" > /dev/null 2>&1 || return 1
+
+  # If a command pattern is provided, ensure the PID still belongs to
+  # the expected process class (prevents stale pidfile false-positives).
+  if [ -n "$expected_cmd_regex" ]; then
+    local cmd
+    cmd=$(ps -p "$pid" -o args= 2>/dev/null || true)
+    [[ "$cmd" =~ $expected_cmd_regex ]] || return 1
+  fi
+
+  return 0
+}
+
+read_pid() {
+  local pidfile="$1"
+  [ -r "$pidfile" ] || return 1
+  local pid
+  pid=$(<"$pidfile") || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  echo "$pid"
+}
+
+wait_for_pid() {
+  local pidfile="$1"
+  local timeout="${2:-10}"
+  local expected_cmd_regex="${3:-}"
+  local count=0
+  
+  while [ $count -lt $timeout ]; do
+    if is_running "$pidfile" "$expected_cmd_regex"; then
+      return 0
+    fi
+    sleep 1
+    count=$((count + 1))
+  done
+  return 1
+}
+
+wait_for_stop() {
+  local pidfile="$1"
+  local timeout="${2:-10}"
+  local expected_cmd_regex="${3:-}"
+  local count=0
+  
+  while [ $count -lt $timeout ]; do
+    if ! is_running "$pidfile" "$expected_cmd_regex"; then
+      return 0
+    fi
+    sleep 1
+    count=$((count + 1))
+  done
+  return 1
+}
+
+#------------------------------------------------------------------------------
+# Redis
+#------------------------------------------------------------------------------
+
+redis_pidfile="$PID_DIR/redis.pid"
+
+check_redis() {
+  redis-cli ping > /dev/null 2>&1
+}
+
+start_redis() {
+  echo "Starting Redis..."
+  
+  if check_redis; then
+    log_ok "Redis already running"
+    return 0
+  fi
+  
+  # Start Redis server (macOS Homebrew default)
+  redis-server --daemonize yes --pidfile "$redis_pidfile" --loglevel warning
+  
+  # Wait for Redis to be ready
+  local count=0
+  while [ $count -lt 10 ]; do
+    if check_redis; then
+      log_ok "Redis started"
+      return 0
+    fi
+    sleep 1
+    count=$((count + 1))
+  done
+  
+  log_fail "Redis failed to start"
+  return 1
+}
+
+stop_redis() {
+  echo "Stopping Redis..."
+  
+  if ! check_redis; then
+    log_warn "Redis not running"
+    rm -f "$redis_pidfile"
+    return 0
+  fi
+  
+  redis-cli shutdown > /dev/null 2>&1 || true
+  
+  local count=0
+  while [ $count -lt 10 ]; do
+    if ! check_redis; then
+      rm -f "$redis_pidfile"
+      log_ok "Redis stopped"
+      return 0
+    fi
+    sleep 1
+    count=$((count + 1))
+  done
+  
+  log_fail "Redis failed to stop gracefully"
+  return 1
+}
+
+#------------------------------------------------------------------------------
+# Rails server
+#------------------------------------------------------------------------------
+
+rails_pidfile="$PID_DIR/server.pid"
+
+start_rails() {
+  echo "Starting Rails server (port $RAILS_PORT)..."
+  
+  if is_running "$rails_pidfile" "puma .*blackboard|bin/rails server"; then
+    local pid
+    pid=$(read_pid "$rails_pidfile" || echo "?")
+    log_ok "Rails already running (pid: $pid)"
+    return 0
+  fi
+  
+  cd "$APP_DIR"
+  
+  # Check database migrations
+  if ! bin/rails db:migrate:status > /dev/null 2>&1; then
+    log_info "Running database migrations..."
+    bin/rails db:migrate
+  fi
+  
+  # Start Rails in background
+  bin/rails server -p "$RAILS_PORT" -d --pid "$rails_pidfile" >> "$LOG_DIR/development.log" 2>&1
+  
+  if wait_for_pid "$rails_pidfile" 15 "puma .*blackboard|bin/rails server"; then
+    local pid
+    pid=$(read_pid "$rails_pidfile" || echo "?")
+    log_ok "Rails started (pid: $pid)"
+    return 0
+  else
+    log_fail "Rails failed to start"
+    return 1
+  fi
+}
+
+stop_rails() {
+  echo "Stopping Rails server..."
+  
+  if ! is_running "$rails_pidfile" "puma .*blackboard|bin/rails server"; then
+    log_warn "Rails not running"
+    rm -f "$rails_pidfile"
+    return 0
+  fi
+  
+  local pid
+  pid=$(read_pid "$rails_pidfile" || true)
+  if [ -z "$pid" ]; then
+    log_warn "Rails pid file disappeared"
+    rm -f "$rails_pidfile"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  
+  if wait_for_stop "$rails_pidfile" 15 "puma .*blackboard|bin/rails server"; then
+    rm -f "$rails_pidfile"
+    log_ok "Rails stopped"
+    return 0
+  else
+    log_warn "Rails didn't stop gracefully, forcing..."
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$rails_pidfile"
+    log_ok "Rails killed"
+    return 0
+  fi
+}
+
+#------------------------------------------------------------------------------
+# Sidekiq
+#------------------------------------------------------------------------------
+
+sidekiq_pidfile="$PID_DIR/sidekiq.pid"
+
+start_sidekiq() {
+  echo "Starting Sidekiq workers..."
+  
+  if is_running "$sidekiq_pidfile" "sidekiq"; then
+    local pid
+    pid=$(read_pid "$sidekiq_pidfile" || echo "?")
+    log_ok "Sidekiq already running (pid: $pid)"
+    return 0
+  fi
+  
+  # Check Redis first
+  if ! check_redis; then
+    log_fail "Cannot start Sidekiq - Redis not available"
+    return 1
+  fi
+  
+  cd "$APP_DIR"
+  
+  # Sidekiq 8.x removed -d flag, use nohup to background
+  nohup bundle exec sidekiq $SIDEKIQ_QUEUES >> "$LOG_DIR/sidekiq.log" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$sidekiq_pidfile"
+  
+  # Give it a moment to start (or fail)
+  sleep 2
+  
+  if is_running "$sidekiq_pidfile" "sidekiq"; then
+    log_ok "Sidekiq started (pid: $pid)"
+    return 0
+  else
+    rm -f "$sidekiq_pidfile"
+    log_fail "Sidekiq failed to start"
+    return 1
+  fi
+}
+
+stop_sidekiq() {
+  echo "Stopping Sidekiq workers..."
+
+  # Kill ALL sidekiq processes for this app — not just the one in the pidfile,
+  # so stale processes from previous sessions don't survive restarts.
+  local pids
+  pids=$(pgrep -f "sidekiq.*blackboard" 2>/dev/null || true)
+
+  if [ -z "$pids" ]; then
+    log_warn "Sidekiq not running"
+    rm -f "$sidekiq_pidfile"
+    return 0
+  fi
+
+  # Send TSTP first to stop fetching new jobs
+  echo "$pids" | xargs kill -TSTP 2>/dev/null || true
+  sleep 2
+
+  # Then TERM for graceful shutdown
+  echo "$pids" | xargs kill -TERM 2>/dev/null || true
+
+  if wait_for_stop "$sidekiq_pidfile" 30; then
+    rm -f "$sidekiq_pidfile"
+    log_ok "Sidekiq stopped"
+  else
+    log_warn "Sidekiq didn't stop gracefully, forcing..."
+    echo "$pids" | xargs kill -9 2>/dev/null || true
+    rm -f "$sidekiq_pidfile"
+    log_ok "Sidekiq killed"
+  fi
+
+  # Clean up any stragglers
+  local remaining
+  remaining=$(pgrep -f "sidekiq.*blackboard" 2>/dev/null || true)
+  if [ -n "$remaining" ]; then
+    echo "$remaining" | xargs kill -9 2>/dev/null || true
+  fi
+
+  return 0
+}
+
+#------------------------------------------------------------------------------
+# Main commands
+#------------------------------------------------------------------------------
+
+do_start() {
+  echo ""
+  echo "========================================"
+  echo "  Starting Blackboard"
+  echo "========================================"
+  echo ""
+  
+  local failed=0
+  
+  # Start in dependency order
+  start_redis || failed=1
+  
+  if [ $failed -eq 0 ]; then
+    start_rails || failed=1
+  fi
+  
+  if [ $failed -eq 0 ]; then
+    start_sidekiq || failed=1
+  fi
+  
+  echo ""
+  if [ $failed -eq 0 ]; then
+    echo "========================================"
+    echo -e "  ${GREEN}Blackboard started OK${NC}"
+    echo "========================================"
+    echo ""
+    echo "  Web UI:    http://localhost:$RAILS_PORT/blackboard"
+    echo "  Sidekiq:   http://localhost:$RAILS_PORT/blackboard/admin/sidekiq"
+    echo ""
+  else
+    echo "========================================"
+    echo -e "  ${RED}Blackboard start FAILED${NC}"
+    echo "========================================"
+    return 1
+  fi
+}
+
+do_stop() {
+  echo ""
+  echo "========================================"
+  echo "  Stopping Blackboard"
+  echo "========================================"
+  echo ""
+  
+  # Stop in reverse order
+  stop_sidekiq
+  stop_rails
+  stop_redis
+  
+  echo ""
+  echo "========================================"
+  echo -e "  ${GREEN}Blackboard stopped OK${NC}"
+  echo "========================================"
+  echo ""
+}
+
+do_status() {
+  echo ""
+  echo "========================================"
+  echo "  Blackboard Status"
+  echo "========================================"
+  echo ""
+  
+  # Redis
+  if check_redis; then
+    log_ok "Redis: running"
+  else
+    log_fail "Redis: stopped"
+  fi
+  
+  # Rails
+  if is_running "$rails_pidfile" "puma .*blackboard|bin/rails server"; then
+    local pid
+    pid=$(read_pid "$rails_pidfile" || echo "?")
+    log_ok "Rails: running (pid: $pid)"
+  else
+    log_fail "Rails: stopped"
+  fi
+  
+  # Sidekiq
+  if is_running "$sidekiq_pidfile" "sidekiq"; then
+    local pid
+    pid=$(read_pid "$sidekiq_pidfile" || echo "?")
+    log_ok "Sidekiq: running (pid: $pid)"
+  else
+    log_fail "Sidekiq: stopped"
+  fi
+  
+  # LLM Processing status (query Rails)
+  echo ""
+  if is_running "$rails_pidfile" "puma .*blackboard|bin/rails server"; then
+    cd "$APP_DIR"
+    local processing_enabled=$(bin/rails runner "puts Setting.get('processing.enabled', false)" 2>/dev/null | tail -n 1 | tr -d '\r')
+    if [ "$processing_enabled" = "true" ]; then
+      echo -e "  ${GREEN}🟢 LLM Processing: ENABLED${NC}"
+    else
+      echo -e "  ${RED}🔴 LLM Processing: DISABLED${NC}"
+    fi
+    
+    # Show counts
+    local obs_counts=$(bin/rails runner "domain = Setting.get('ui.domain', 'cybersecurity'); puts \"#{Observable.for_domain(domain).count} total / #{Observable.unnormalized.for_domain(domain).count} unnormalized (#{domain} domain)\"" 2>/dev/null | tail -n 1 | tr -d '\r')
+    local hyp_count=$(bin/rails runner "domain = Setting.get('ui.domain', 'cybersecurity'); puts Hypothesis.for_domain(domain).where(status: 'proposed').count" 2>/dev/null | tail -n 1 | tr -d '\r')
+    local alert_count=$(bin/rails runner "domain = Setting.get('ui.domain', 'cybersecurity'); puts Alert.for_domain(domain).open_alerts.count" 2>/dev/null | tail -n 1 | tr -d '\r')
+    echo ""
+    echo "  Observables: $obs_counts"
+    echo "  Pending hypotheses: $hyp_count"
+    echo "  Open alerts: $alert_count"
+
+    # Per-KS stats (last 24h)
+    echo ""
+    echo "  Knowledge Sources (last 24h):"
+    bin/rails runner "
+      since = 24.hours.ago
+      domain = Setting.get('ui.domain', 'cybersecurity')
+      roles = %w[normalizer proposer critic verifier correlator]
+      roles.each do |role|
+        ks = KnowledgeSource.for_domain(domain).find_by(role: role)
+        unless ks
+          puts format('    %-12s  no KS configured', role)
+          next
+        end
+        calls = ks.llm_calls.where('created_at >= ?', since)
+        total = calls.count
+        primary_calls  = calls.where(fallback: [false, nil])
+        fallback_calls = calls.where(fallback: true)
+        if total == 0
+          provider = KsProviderClient.provider_key_for(ks)
+          model    = KsProviderClient.model_for(ks)
+          puts format('    %-12s  0 calls  [%s/%s]', role, provider, model)
+          next
+        end
+        ok   = primary_calls.successful.count
+        ptotal = primary_calls.count
+        pct  = ptotal > 0 ? (ok.to_f / ptotal * 100).round : 0
+        avg  = primary_calls.successful.average(:duration_ms)&.round || 0
+        last_call = primary_calls.order(created_at: :desc).first
+        ago  = last_call ? ((Time.current - last_call.created_at) / 60).round : nil
+        ago_str = ago ? \"last: #{ago}m ago\" : ''
+        provider = last_call&.provider || KsProviderClient.provider_key_for(ks)
+        model    = last_call&.model    || KsProviderClient.model_for(ks)
+        puts format('    %-12s  %2d call%s  avg %dms  %3d%% success  %s  [%s]',
+                    role, ptotal, (ptotal == 1 ? '' : 's'), avg, pct, ago_str, \"#{provider}/#{model}\")
+        if ks.fallback_provider.present? || fallback_calls.any?
+          fb_total = fallback_calls.count
+          fb_ok    = fallback_calls.successful.count
+          fb_pct   = fb_total > 0 ? (fb_ok.to_f / fb_total * 100).round : 0
+          fb_avg   = fallback_calls.successful.average(:duration_ms)&.round || 0
+          fb_last  = fallback_calls.order(created_at: :desc).first
+          fb_ago   = fb_last ? ((Time.current - fb_last.created_at) / 60).round : nil
+          fb_ago_str = fb_ago ? \"last: #{fb_ago}m ago\" : 'never used'
+          fb_provider = fb_last&.provider || ks.fallback_provider
+          fb_model    = fb_last&.model    || ks.fallback_model
+          if fb_total > 0
+            puts format('    %-12s  %2d fallback%s  avg %dms  %3d%% success  %s  [%s]',
+                        '', fb_total, (fb_total == 1 ? '' : 's'), fb_avg, fb_pct, fb_ago_str, \"#{fb_provider}/#{fb_model}\")
+          else
+            puts format('    %-12s  fallback: %s/%s (never used)', '', fb_provider, fb_model)
+          end
+        end
+      end
+    " 2>/dev/null | sed '/connecting to Redis/d'
+
+    # Pipeline idle/busy indicator
+    echo ""
+    bin/rails runner '
+      require "sidekiq/api"
+      Sidekiq.logger.level = Logger::ERROR
+      stats   = Sidekiq::Stats.new
+      workers = Sidekiq::Workers.new
+      queued  = stats.queued
+      running = workers.size
+
+      last_call = LlmCall.order(created_at: :desc).first
+      last_ago  = last_call ? ((Time.current - last_call.created_at) / 60).round : nil
+
+      if queued > 0 || running > 0
+        parts = []
+        parts << "#{queued} queued" if queued > 0
+        parts << "#{running} running" if running > 0
+        puts "  \e[0;33m⟳  Pipeline processing — #{parts.join(", ")}\e[0m"
+      elsif last_ago && last_ago < 2
+        puts "  \e[0;33m⟳  Pipeline processing — jobs finishing up\e[0m"
+      elsif last_ago
+        puts "  \e[0;32m✓  Pipeline idle — last activity #{last_ago}m ago\e[0m"
+      else
+        puts "  \e[2m—  Pipeline idle — no activity\e[0m"
+      end
+    ' 2>/dev/null | sed '/connecting to Redis/d'
+  fi
+
+  echo ""
+}
+
+do_restart() {
+  do_stop
+  sleep 2
+  do_start
+}
+
+do_flush() {
+  echo ""
+  echo "========================================"
+  echo -e "  ${RED}Blackboard Data Flush${NC}"
+  echo "========================================"
+  echo ""
+  echo -e "  ${YELLOW}This will permanently delete:${NC}"
+  echo "    • All observables, hypotheses, critiques, verifications, alerts"
+  echo "    • All LLM call history, evidence windows, control shell decisions"
+  echo "    • All board events and blackboard logs"
+  echo "    • All queued, scheduled, and retry Sidekiq jobs"
+  echo "    • Sensor read positions (reset to 0)"
+  echo "    • Test event log: tmp/test_security.log"
+  echo ""
+  printf "  Type 'flush' to confirm: "
+  read -r confirm
+  if [ "$confirm" != "flush" ]; then
+    echo ""
+    log_warn "Flush cancelled"
+    echo ""
+    return 0
+  fi
+
+  echo ""
+
+  # Stop Sidekiq first so no in-flight jobs write data during the flush
+  if is_running "$sidekiq_pidfile" "sidekiq"; then
+    echo "Stopping Sidekiq before flush..."
+    stop_sidekiq
+  fi
+
+  # Locate psql (Homebrew may not be in script PATH)
+  local psql_bin
+  psql_bin=$(find_psql) || { log_fail "psql not found — install postgresql or add it to PATH"; return 1; }
+
+  # Clear pipeline tables directly via psql — no Rails required
+  echo "Clearing pipeline data..."
+  "$psql_bin" -d blackboard_development -q -c "
+    TRUNCATE TABLE
+      alerts, control_shell_decisions, critiques, verifications,
+      hypothesis_observables, hypotheses, observables, llm_calls,
+      evidence_windows, board_events, blackboard_logs
+    RESTART IDENTITY CASCADE;
+    UPDATE sensor_configurations
+      SET last_read_position = 0, last_read_at = NULL, last_error = NULL;
+  " 2>&1 || { log_fail "psql flush failed — is PostgreSQL running?"; return 1; }
+
+  log_ok "Pipeline data cleared"
+
+  # Flush entire Redis DB 1 — clears Sidekiq queues, retry/scheduled sets,
+  # and the BlackboardEvent Redis Stream
+  echo "Flushing Redis..."
+  if check_redis; then
+    redis-cli -n 1 FLUSHDB > /dev/null 2>&1
+    log_ok "Redis DB flushed (queues, stream, scheduled jobs)"
+  else
+    log_warn "Redis not reachable — skipping Redis flush"
+  fi
+
+  # Truncate the test event log
+  echo "Clearing test event log..."
+  > "$APP_DIR/tmp/test_security.log" 2>/dev/null || true
+  log_ok "Test event log cleared (tmp/test_security.log)"
+
+  echo ""
+  echo "========================================"
+  echo -e "  ${GREEN}Flush complete — clean slate${NC}"
+  echo "========================================"
+  echo ""
+  echo "  Sidekiq is stopped. Run 'blackboard start' to bring services back up."
+  echo ""
+}
+
+#------------------------------------------------------------------------------
+# Entry point
+#------------------------------------------------------------------------------
+
+case "${1:-}" in
+  start)
+    do_start
+    ;;
+  stop)
+    do_stop
+    ;;
+  status)
+    do_status
+    ;;
+  restart)
+    do_restart
+    ;;
+  flush)
+    do_flush
+    ;;
+  *)
+    echo "Usage: blackboard {start|stop|status|restart|flush}"
+    echo ""
+    echo "Commands:"
+    echo "  start    - Start Redis, Rails, and Sidekiq"
+    echo "  stop     - Stop all services gracefully"
+    echo "  status   - Show status of all services"
+    echo "  restart  - Stop then start all services"
+    echo "  flush    - Wipe all pipeline data for a clean-slate test run"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,14 @@
+en:
+  domains:
+    medical:
+      subtitle: "Clinical Monitoring System"
+      models:
+        observable:
+          one: "Patient Event"
+          other: "Patient Events"
+        hypothesis:
+          one: "Clinical Finding"
+          other: "Clinical Findings"
+        campaign:
+          one: "Care Episode"
+          other: "Care Episodes"

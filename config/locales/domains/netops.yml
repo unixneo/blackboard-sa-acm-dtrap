@@ -1,0 +1,14 @@
+en:
+  domains:
+    netops:
+      subtitle: "Network Operations Center"
+      models:
+        observable:
+          one: "Log Entry"
+          other: "Log Entries"
+        hypothesis:
+          one: "Incident"
+          other: "Incidents"
+        campaign:
+          one: "Attack Chain"
+          other: "Attack Chains"

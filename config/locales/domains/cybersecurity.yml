@@ -1,0 +1,14 @@
+en:
+  domains:
+    cybersecurity:
+      subtitle: "Situation Awareness Architecture"
+      models:
+        observable:
+          one: "Observable"
+          other: "Observables"
+        hypothesis:
+          one: "Hypothesis"
+          other: "Hypotheses"
+        campaign:
+          one: "Campaign"
+          other: "Campaigns"

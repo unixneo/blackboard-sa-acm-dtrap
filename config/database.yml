@@ -1,0 +1,20 @@
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+
+development:
+  <<: *default
+  database: blackboard_development
+  password: <%= ENV["PSQL_PASSWORD"] %>
+
+test:
+  <<: *default
+  database: blackboard_test
+  password: <%= ENV["PSQL_PASSWORD"] %>
+
+production:
+  <<: *default
+  database: blackboard_development
+  password: <%= ENV["PSQL_PASSWORD"] %>
+    #url: <%= ENV["DATABASE_URL"] %>

@@ -1,0 +1,14 @@
+en:
+  domains:
+    financial:
+      subtitle: "Financial Risk Intelligence"
+      models:
+        observable:
+          one: "Market Signal"
+          other: "Market Signals"
+        hypothesis:
+          one: "Risk Flag"
+          other: "Risk Flags"
+        campaign:
+          one: "Fraud Pattern"
+          other: "Fraud Patterns"
