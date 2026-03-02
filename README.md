@@ -8,11 +8,9 @@ continuous situation awareness, updated for the age of large language models.
 Evidence windowing, hypothesis gating, and configurable thresholds are built in.
 Original event-bus implementation is preserved on the `original_blackboard` branch.
 
-## White Paper Draft
+## Preprint
 
-A working white paper draft is available at [`PAPER.txt`](PAPER.txt).
-It documents Blackboard SA as a multi-provider, multi-model situation awareness
-architecture and includes initial references (including Bass 2000 CACM).
+https://zenodo.org/records/18824512
 
 ---
 
