@@ -12,6 +12,10 @@ Original event-bus implementation is preserved on the `original_blackboard` bran
 
 https://zenodo.org/records/18824512
 
+## Code (Private Repo - Request Access)
+
+https://github.com/unixneo/blackboard
+
 ---
 
 ## Architecture
