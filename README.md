@@ -9,8 +9,7 @@ Evidence windowing, hypothesis gating, and configurable thresholds are built in.
 Original event-bus implementation is preserved on the `original_blackboard` branch.
 
 
-## Citation (Preprint)
-
+## Citation
 Bass, Tim. "Blackboard SA: Operationalizing LLM Knowledge Source Specialization for Cyber Situational Awareness." Preprint, Zenodo, 2026. https://zenodo.org/records/18824512
 
 ## Code (Private Repo - Request Access)
