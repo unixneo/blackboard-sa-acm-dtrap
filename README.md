@@ -10,6 +10,8 @@ Original event-bus implementation is preserved on the `original_blackboard` bran
 
 ## Preprint
 
+Blackboard SA: Operationalizing LLM Knowledge Source Specialization for Cyber Situational Awareness
+
 https://zenodo.org/records/18824512
 
 ## Code (Private Repo - Request Access)
